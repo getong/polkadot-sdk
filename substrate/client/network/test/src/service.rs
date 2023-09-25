@@ -246,6 +246,23 @@ impl TestNetworkBuilder {
 			full_net_config.add_request_response_protocol(config);
 		}
 
+		struct TestExecutor;
+
+		impl litep2p::executor::Executor for TestExecutor {
+			fn run(&self, future: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>) {
+				let _ = tokio::spawn(future);
+			}
+
+			fn run_with_name(
+				&self,
+				_: &'static str,
+				future: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>,
+			) {
+				let _ = tokio::spawn(future);
+			}
+		}
+		let executor = Arc::new(TestExecutor {});
+
 		let genesis_hash =
 			client.hash(Zero::zero()).ok().flatten().expect("Genesis block exists; qed");
 		let worker = NetworkWorker::<
@@ -263,8 +280,8 @@ impl TestNetworkBuilder {
 			}),
 			genesis_hash,
 			network_config: full_net_config,
-			peer_store: Arc::clone(&peer_store_handle),
 			protocol_id,
+			spawn_handle: executor,
 			fork_id,
 			metrics_registry: None,
 			bitswap_config: None,

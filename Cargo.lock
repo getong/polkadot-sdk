@@ -4991,18 +4991,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "enum-as-inner"
-version = "0.6.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5ffccbb6966c05b32ef8fbac435df276c4ae4d3dc55a8cd0eb9745e6c12f546a"
-dependencies = [
- "heck",
- "proc-macro2",
- "quote",
- "syn 2.0.48",
-]
-
-[[package]]
 name = "enumflags2"
 version = "0.7.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7460,7 +7448,7 @@ dependencies = [
  "log",
  "parking_lot 0.12.1",
  "smallvec",
- "trust-dns-resolver 0.22.0",
+ "trust-dns-resolver",
 ]
 
 [[package]]
@@ -7548,7 +7536,7 @@ dependencies = [
  "smallvec",
  "socket2 0.4.10",
  "tokio",
- "trust-dns-proto 0.22.0",
+ "trust-dns-proto",
  "void",
 ]
 
@@ -7926,6 +7914,7 @@ dependencies = [
 [[package]]
 name = "litep2p"
 version = "0.2.0"
+source = "git+https://github.com/altonen/litep2p?branch=polkadot-fixes#ee93a32f961e72c8691bce0642ccb566f9f3efc6"
 dependencies = [
  "async-trait",
  "bs58 0.4.0",
@@ -7937,11 +7926,9 @@ dependencies = [
  "futures-timer",
  "hex-literal",
  "indexmap 2.1.0",
- "libc",
  "mockall",
  "multiaddr",
  "multihash 0.17.0",
- "network-interface",
  "parking_lot 0.12.1",
  "pin-project",
  "prost",
@@ -7964,7 +7951,6 @@ dependencies = [
  "tokio-tungstenite 0.20.1",
  "tokio-util",
  "tracing",
- "trust-dns-resolver 0.23.2",
  "uint",
  "unsigned-varint",
  "url",
@@ -8632,18 +8618,6 @@ dependencies = [
  "libc",
  "log",
  "tokio",
-]
-
-[[package]]
-name = "network-interface"
-version = "1.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0d68759ef97fe9c9e46f79ea8736c19f1d28992e24c8dc8ce86752918bfeaae7"
-dependencies = [
- "cc",
- "libc",
- "thiserror",
- "winapi",
 ]
 
 [[package]]
@@ -16235,9 +16209,11 @@ dependencies = [
  "ip_network",
  "libp2p",
  "linked_hash_set",
+ "litep2p",
  "log",
  "mockall",
  "multistream-select",
+ "once_cell",
  "parity-scale-codec",
  "parking_lot 0.12.1",
  "partial_sort",
@@ -16252,6 +16228,7 @@ dependencies = [
  "sc-network-sync",
  "sc-network-types",
  "sc-utils",
+ "schnellru",
  "serde",
  "serde_json",
  "smallvec",
@@ -16272,6 +16249,7 @@ dependencies = [
  "tokio-test",
  "tokio-util",
  "unsigned-varint",
+ "void",
  "wasm-timer",
  "zeroize",
 ]
@@ -16407,6 +16385,7 @@ dependencies = [
  "futures",
  "futures-timer",
  "libp2p",
+ "litep2p",
  "log",
  "parking_lot 0.12.1",
  "rand 0.8.5",
@@ -20784,7 +20763,7 @@ dependencies = [
  "async-trait",
  "cfg-if",
  "data-encoding",
- "enum-as-inner 0.5.1",
+ "enum-as-inner",
  "futures-channel",
  "futures-io",
  "futures-util",
@@ -20794,31 +20773,6 @@ dependencies = [
  "rand 0.8.5",
  "smallvec",
  "socket2 0.4.10",
- "thiserror",
- "tinyvec",
- "tokio",
- "tracing",
- "url",
-]
-
-[[package]]
-name = "trust-dns-proto"
-version = "0.23.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3119112651c157f4488931a01e586aa459736e9d6046d3bd9105ffb69352d374"
-dependencies = [
- "async-trait",
- "cfg-if",
- "data-encoding",
- "enum-as-inner 0.6.0",
- "futures-channel",
- "futures-io",
- "futures-util",
- "idna 0.4.0",
- "ipnet",
- "once_cell",
- "rand 0.8.5",
- "smallvec",
  "thiserror",
  "tinyvec",
  "tokio",
@@ -20843,28 +20797,7 @@ dependencies = [
  "thiserror",
  "tokio",
  "tracing",
- "trust-dns-proto 0.22.0",
-]
-
-[[package]]
-name = "trust-dns-resolver"
-version = "0.23.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "10a3e6c3aff1718b3c73e395d1f35202ba2ffa847c6a62eea0db8fb4cfe30be6"
-dependencies = [
- "cfg-if",
- "futures-util",
- "ipconfig",
- "lru-cache",
- "once_cell",
- "parking_lot 0.12.1",
- "rand 0.8.5",
- "resolv-conf",
- "smallvec",
- "thiserror",
- "tokio",
- "tracing",
- "trust-dns-proto 0.23.2",
+ "trust-dns-proto",
 ]
 
 [[package]]
