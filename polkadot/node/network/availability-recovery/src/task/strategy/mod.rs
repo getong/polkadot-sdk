@@ -14,15 +14,26 @@
 // You should have received a copy of the GNU General Public License
 // along with Polkadot.  If not, see <http://www.gnu.org/licenses/>.
 
-//! Recovery task and associated strategies.
+//! Recovery strategies.
 
-#![warn(missing_docs)]
+mod chunks;
+mod full;
+mod systematic;
 
-use crate::{
-	futures_undead::FuturesUndead, metrics::Metrics, ErasureTask, PostRecoveryCheck, LOG_TARGET,
+pub use self::{
+	chunks::{FetchChunks, FetchChunksParams},
+	full::{FetchFull, FetchFullParams},
+	systematic::{FetchSystematicChunks, FetchSystematicChunksParams},
 };
-use futures::{channel::oneshot, SinkExt};
-use parity_scale_codec::Encode;
+use crate::{
+	futures_undead::FuturesUndead, ErasureTask, PostRecoveryCheck, RecoveryParams, LOG_TARGET,
+};
+
+use futures::{
+	channel::{mpsc, oneshot},
+	SinkExt,
+};
+use parity_scale_codec::Decode;
 use polkadot_erasure_coding::branch_hash;
 #[cfg(not(test))]
 use polkadot_node_network_protocol::request_response::CHUNK_REQUEST_TIMEOUT;
@@ -34,17 +45,14 @@ use polkadot_node_subsystem::{
 	messages::{AvailabilityStoreMessage, NetworkBridgeTxMessage},
 	overseer, RecoveryError,
 };
-use polkadot_primitives::{
-	AuthorityDiscoveryId, BlakeTwo256, CandidateHash, ChunkIndex, Hash, HashT, ValidatorIndex,
-};
-use rand::seq::SliceRandom;
+use polkadot_primitives::{AuthorityDiscoveryId, BlakeTwo256, ChunkIndex, HashT, ValidatorIndex};
 use sc_network::{IfDisconnected, OutboundFailure, RequestFailure};
 use std::{
 	collections::{BTreeMap, HashMap, VecDeque},
 	time::Duration,
 };
 
-// How many parallel recovery tasks should be running at once.
+// How many parallel chunk fetching requests should be running at once.
 const N_PARALLEL: usize = 50;
 
 /// Time after which we consider a request to have failed
@@ -108,6 +116,52 @@ fn is_chunk_valid(params: &RecoveryParams, chunk: &ErasureChunk) -> bool {
 	true
 }
 
+/// Perform the validity checks after recovery.
+async fn do_post_recovery_check(
+	params: &RecoveryParams,
+	data: AvailableData,
+	erasure_task_tx: &mut mpsc::Sender<ErasureTask>,
+) -> Result<AvailableData, RecoveryError> {
+	match params.post_recovery_check {
+		PostRecoveryCheck::Reencode => {
+			// Send request to re-encode the chunks and check merkle root.
+			let (reencode_tx, reencode_rx) = oneshot::channel();
+			erasure_task_tx
+				.send(ErasureTask::Reencode(
+					params.n_validators,
+					params.erasure_root,
+					data,
+					reencode_tx,
+				))
+				.await
+				.map_err(|_| RecoveryError::ChannelClosed)?;
+
+			reencode_rx.await.map_err(|_| RecoveryError::ChannelClosed)?.ok_or_else(|| {
+				gum::trace!(
+					target: LOG_TARGET,
+					candidate_hash = ?params.candidate_hash,
+					erasure_root = ?params.erasure_root,
+					"Data recovery error - root mismatch",
+				);
+				RecoveryError::Invalid
+			})
+		},
+		PostRecoveryCheck::PovHash => {
+			let pov = data.pov.clone();
+			(pov.hash() == params.pov_hash).then_some(data).ok_or_else(|| {
+				gum::trace!(
+					target: LOG_TARGET,
+					candidate_hash = ?params.candidate_hash,
+					expected_pov_hash = ?params.pov_hash,
+					actual_pov_hash = ?pov.hash(),
+					"Data recovery error - PoV hash mismatch",
+				);
+				RecoveryError::Invalid
+			})
+		},
+	}
+}
+
 #[async_trait::async_trait]
 /// Common trait for runnable recovery strategies.
 pub trait RecoveryStrategy<Sender: overseer::AvailabilityRecoverySenderTrait>: Send {
@@ -126,41 +180,20 @@ pub trait RecoveryStrategy<Sender: overseer::AvailabilityRecoverySenderTrait>: S
 	fn strategy_type(&self) -> &'static str;
 }
 
-/// Recovery parameters common to all strategies in a `RecoveryTask`.
-#[derive(Clone)]
-pub struct RecoveryParams {
-	/// Discovery ids of `validators`.
-	pub validator_authority_keys: Vec<AuthorityDiscoveryId>,
-
-	/// Number of validators.
-	pub n_validators: usize,
-
-	/// The number of chunks needed.
-	pub threshold: usize,
-
-	/// A hash of the relevant candidate.
-	pub candidate_hash: CandidateHash,
-
-	/// The root of the erasure encoding of the candidate.
-	pub erasure_root: Hash,
-
-	/// Metrics to report.
-	pub metrics: Metrics,
-
-	/// Do not request data from availability-store. Useful for collators.
-	pub bypass_availability_store: bool,
-
-	/// The type of check to perform after available data was recovered.
-	pub post_recovery_check: PostRecoveryCheck,
-
-	/// The blake2-256 hash of the PoV.
-	pub pov_hash: Hash,
-}
-
 /// Utility type used for recording the result of requesting a chunk from a validator.
-pub enum ErrorRecord {
+enum ErrorRecord {
 	NonFatal(u32),
 	Fatal,
+}
+
+/// Helper struct used for the `received_chunks` mapping.
+/// Compared to `ErasureChunk`, it doesn't need to hold the `ChunkIndex` (because it's the key used
+/// for the map) and proof, but needs to hold the `ValidatorIndex` instead.
+struct Chunk {
+	/// The erasure-encoded chunk of data belonging to the candidate block.
+	chunk: Vec<u8>,
+	/// The validator index that corresponds to this chunk. Not always the same as the chunk index.
+	validator_index: ValidatorIndex,
 }
 
 /// Intermediate/common data that must be passed between `RecoveryStrategy`s belonging to the
@@ -170,18 +203,18 @@ pub struct State {
 	/// This MUST be a `BTreeMap` in order for systematic recovery to work (the algorithm assumes
 	/// that chunks are ordered by their index). If we ever switch this to some non-ordered
 	/// collection, we need to add a sort step to the systematic recovery.
-	received_chunks: BTreeMap<ChunkIndex, ErasureChunk>,
+	received_chunks: BTreeMap<ChunkIndex, Chunk>,
 
 	/// A record of errors returned when requesting a chunk from a validator.
-	recorded_errors: HashMap<(ChunkIndex, ValidatorIndex), ErrorRecord>,
+	recorded_errors: HashMap<(AuthorityDiscoveryId, ValidatorIndex), ErrorRecord>,
 }
 
 impl State {
-	fn new() -> Self {
+	pub fn new() -> Self {
 		Self { received_chunks: BTreeMap::new(), recorded_errors: HashMap::new() }
 	}
 
-	fn insert_chunk(&mut self, chunk_index: ChunkIndex, chunk: ErasureChunk) {
+	fn insert_chunk(&mut self, chunk_index: ChunkIndex, chunk: Chunk) {
 		self.received_chunks.insert(chunk_index, chunk);
 	}
 
@@ -189,13 +222,21 @@ impl State {
 		self.received_chunks.len()
 	}
 
-	fn record_error_fatal(&mut self, chunk_index: ChunkIndex, validator_index: ValidatorIndex) {
-		self.recorded_errors.insert((chunk_index, validator_index), ErrorRecord::Fatal);
+	fn record_error_fatal(
+		&mut self,
+		authority_id: AuthorityDiscoveryId,
+		validator_index: ValidatorIndex,
+	) {
+		self.recorded_errors.insert((authority_id, validator_index), ErrorRecord::Fatal);
 	}
 
-	fn record_error_non_fatal(&mut self, chunk_index: ChunkIndex, validator_index: ValidatorIndex) {
+	fn record_error_non_fatal(
+		&mut self,
+		authority_id: AuthorityDiscoveryId,
+		validator_index: ValidatorIndex,
+	) {
 		self.recorded_errors
-			.entry((chunk_index, validator_index))
+			.entry((authority_id, validator_index))
 			.and_modify(|record| {
 				if let ErrorRecord::NonFatal(ref mut count) = record {
 					*count = count.saturating_add(1);
@@ -206,11 +247,10 @@ impl State {
 
 	fn can_retry_request(
 		&self,
-		chunk_index: ChunkIndex,
-		validator_index: ValidatorIndex,
+		key: &(AuthorityDiscoveryId, ValidatorIndex),
 		retry_threshold: u32,
 	) -> bool {
-		match self.recorded_errors.get(&(chunk_index, validator_index)) {
+		match self.recorded_errors.get(key) {
 			None => true,
 			Some(entry) => match entry {
 				ErrorRecord::Fatal => false,
@@ -220,12 +260,12 @@ impl State {
 		}
 	}
 
-	/// Retrieve the local chunks held in the av-store (either 0 or 1).
+	/// Retrieve the local chunks held in the av-store (should be either 0 or 1).
 	async fn populate_from_av_store<Sender: overseer::AvailabilityRecoverySenderTrait>(
 		&mut self,
 		params: &RecoveryParams,
 		sender: &mut Sender,
-	) -> Vec<ChunkIndex> {
+	) -> Vec<(ValidatorIndex, ChunkIndex)> {
 		let (tx, rx) = oneshot::channel();
 		sender
 			.send_message(AvailabilityStoreMessage::QueryAllChunks(params.candidate_hash, tx))
@@ -235,9 +275,12 @@ impl State {
 			Ok(chunks) => {
 				// This should either be length 1 or 0. If we had the whole data,
 				// we wouldn't have reached this stage.
-				let chunk_indices: Vec<_> = chunks.iter().map(|c| c.index).collect();
+				let chunk_indices: Vec<_> = chunks
+					.iter()
+					.map(|(validator_index, chunk)| (*validator_index, chunk.index))
+					.collect();
 
-				for chunk in chunks {
+				for (validator_index, chunk) in chunks {
 					if is_chunk_valid(params, &chunk) {
 						gum::trace!(
 							target: LOG_TARGET,
@@ -245,7 +288,10 @@ impl State {
 							chunk_index = ?chunk.index,
 							"Found valid chunk on disk"
 						);
-						self.insert_chunk(chunk.index, chunk);
+						self.insert_chunk(
+							chunk.index,
+							Chunk { chunk: chunk.chunk, validator_index },
+						);
 					} else {
 						gum::error!(
 							target: LOG_TARGET,
@@ -275,9 +321,9 @@ impl State {
 		params: &RecoveryParams,
 		sender: &mut Sender,
 		desired_requests_count: usize,
-		validators: &mut VecDeque<(ChunkIndex, ValidatorIndex)>,
+		validators: &mut VecDeque<(AuthorityDiscoveryId, ValidatorIndex)>,
 		requesting_chunks: &mut FuturesUndead<(
-			ChunkIndex,
+			AuthorityDiscoveryId,
 			ValidatorIndex,
 			Result<Option<ErasureChunk>, RequestError>,
 		)>,
@@ -298,39 +344,60 @@ impl State {
 		);
 
 		while requesting_chunks.len() < desired_requests_count {
-			if let Some((chunk_index, validator_index)) = validators.pop_back() {
-				let validator = params.validator_authority_keys[validator_index.0 as usize].clone();
+			if let Some((authority_id, validator_index)) = validators.pop_back() {
 				gum::trace!(
 					target: LOG_TARGET,
-					?validator,
+					?authority_id,
 					?validator_index,
-					?chunk_index,
 					?candidate_hash,
 					"Requesting chunk",
 				);
 
 				// Request data.
-				let raw_request = req_res::v1::ChunkFetchingRequest {
+				let raw_request_v2 = req_res::v2::ChunkFetchingRequest {
 					candidate_hash: params.candidate_hash,
-					index: chunk_index,
+					index: validator_index,
 				};
+				let raw_request_v1 = req_res::v1::ChunkFetchingRequest::from(raw_request_v2);
 
-				let (req, res) = OutgoingRequest::new(Recipient::Authority(validator), raw_request);
-				requests.push(Requests::ChunkFetchingV1(req));
+				let (req, res) = OutgoingRequest::new_with_fallback(
+					Recipient::Authority(authority_id.clone()),
+					raw_request_v2,
+					raw_request_v1,
+				);
+				requests.push(Requests::ChunkFetching(req));
 
 				params.metrics.on_chunk_request_issued(strategy_type);
 				let timer = params.metrics.time_chunk_request(strategy_type);
+				let v1_protocol_name = params.req_v1_protocol_name.clone();
+				let v2_protocol_name = params.req_v2_protocol_name.clone();
 
 				requesting_chunks.push(Box::pin(async move {
 					let _timer = timer;
 					let res = match res.await {
-						Ok(req_res::v1::ChunkFetchingResponse::Chunk(chunk)) =>
-							Ok(Some(chunk.recombine_into_chunk(&raw_request))),
-						Ok(req_res::v1::ChunkFetchingResponse::NoSuchChunk) => Ok(None),
+						Ok((bytes, protocol)) =>
+							if v2_protocol_name == protocol {
+								match req_res::v2::ChunkFetchingResponse::decode(&mut &bytes[..]) {
+									Ok(req_res::v2::ChunkFetchingResponse::Chunk(chunk)) =>
+										Ok(Some(chunk.into())),
+									Ok(req_res::v2::ChunkFetchingResponse::NoSuchChunk) => Ok(None),
+									Err(e) => Err(RequestError::InvalidResponse(e)),
+								}
+							} else if v1_protocol_name == protocol {
+								match req_res::v1::ChunkFetchingResponse::decode(&mut &bytes[..]) {
+									Ok(req_res::v1::ChunkFetchingResponse::Chunk(chunk)) =>
+										Ok(Some(chunk.recombine_into_chunk(&raw_request_v1))),
+									Ok(req_res::v1::ChunkFetchingResponse::NoSuchChunk) => Ok(None),
+									Err(e) => Err(RequestError::InvalidResponse(e)),
+								}
+							} else {
+								Err(RequestError::NetworkError(RequestFailure::UnknownProtocol))
+							},
+
 						Err(e) => Err(e),
 					};
 
-					(chunk_index, validator_index, res)
+					(authority_id, validator_index, res)
 				}));
 			} else {
 				break
@@ -353,15 +420,15 @@ impl State {
 		strategy_type: &str,
 		params: &RecoveryParams,
 		retry_threshold: u32,
-		validators: &mut VecDeque<(ChunkIndex, ValidatorIndex)>,
+		validators: &mut VecDeque<(AuthorityDiscoveryId, ValidatorIndex)>,
 		requesting_chunks: &mut FuturesUndead<(
-			ChunkIndex,
+			AuthorityDiscoveryId,
 			ValidatorIndex,
 			Result<Option<ErasureChunk>, RequestError>,
 		)>,
 		// If supplied, these validators will be used as a backup for requesting chunks. They
 		// should hold all chunks. Each of them will only be used to query one chunk.
-		backup_validators: &mut Vec<ValidatorIndex>,
+		backup_validators: &mut Vec<AuthorityDiscoveryId>,
 		// Function that returns `true` when this strategy can conclude. Either if we got enough
 		// chunks or if it's impossible.
 		can_conclude: impl Fn(
@@ -387,7 +454,7 @@ impl State {
 		{
 			total_received_responses += 1;
 
-			let (chunk_index, validator_index, request_result) = res;
+			let (authority_id, validator_index, request_result) = res;
 
 			let mut is_error = false;
 
@@ -398,17 +465,20 @@ impl State {
 						gum::trace!(
 							target: LOG_TARGET,
 							candidate_hash = ?params.candidate_hash,
-							?chunk_index,
+							?authority_id,
 							?validator_index,
 							"Received valid chunk",
 						);
-						self.insert_chunk(chunk.index, chunk);
+						self.insert_chunk(
+							chunk.index,
+							Chunk { chunk: chunk.chunk, validator_index },
+						);
 					} else {
 						metrics.on_chunk_request_invalid(strategy_type);
 						error_count += 1;
 						// Record that we got an invalid chunk so that subsequent strategies don't
 						// try requesting this again.
-						self.record_error_fatal(chunk_index, validator_index);
+						self.record_error_fatal(authority_id.clone(), validator_index);
 						is_error = true;
 					},
 				Ok(None) => {
@@ -416,14 +486,14 @@ impl State {
 					gum::trace!(
 						target: LOG_TARGET,
 						candidate_hash = ?params.candidate_hash,
-						?chunk_index,
+						?authority_id,
 						?validator_index,
-						"Validator did not have the requested chunk",
+						"Validator did not have the chunk",
 					);
 					error_count += 1;
 					// Record that the validator did not have this chunk so that subsequent
 					// strategies don't try requesting this again.
-					self.record_error_fatal(chunk_index, validator_index);
+					self.record_error_fatal(authority_id.clone(), validator_index);
 					is_error = true;
 				},
 				Err(err) => {
@@ -433,7 +503,7 @@ impl State {
 						target: LOG_TARGET,
 						candidate_hash= ?params.candidate_hash,
 						?err,
-						?chunk_index,
+						?authority_id,
 						?validator_index,
 						"Failure requesting chunk",
 					);
@@ -448,14 +518,14 @@ impl State {
 								target: LOG_TARGET,
 								candidate_hash = ?params.candidate_hash,
 								?err,
-								?chunk_index,
+								?authority_id,
 								?validator_index,
 								"Chunk fetching response was invalid",
 							);
 
 							// Record that we got an invalid chunk so that this or subsequent
 							// strategies don't try requesting this again.
-							self.record_error_fatal(chunk_index, validator_index);
+							self.record_error_fatal(authority_id.clone(), validator_index);
 						},
 						RequestError::NetworkError(err) => {
 							// No debug logs on general network errors - that became very spammy
@@ -468,36 +538,35 @@ impl State {
 
 							// Record that we got a non-fatal error so that this or subsequent
 							// strategies will retry requesting this only a limited number of times.
-							self.record_error_non_fatal(chunk_index, validator_index);
+							self.record_error_non_fatal(authority_id.clone(), validator_index);
 						},
 						RequestError::Canceled(_) => {
 							metrics.on_chunk_request_error(strategy_type);
 
 							// Record that we got a non-fatal error so that this or subsequent
 							// strategies will retry requesting this only a limited number of times.
-							self.record_error_non_fatal(chunk_index, validator_index);
+							self.record_error_non_fatal(authority_id.clone(), validator_index);
 						},
 					}
 				},
 			}
 
-			if is_error && !self.received_chunks.contains_key(&chunk_index) {
+			if is_error {
 				// First, see if we can retry the request.
-				if self.can_retry_request(chunk_index, validator_index, retry_threshold) {
-					validators.push_front((chunk_index, validator_index));
+				if self.can_retry_request(&(authority_id.clone(), validator_index), retry_threshold)
+				{
+					validators.push_front((authority_id, validator_index));
 				} else {
 					// Otherwise, try requesting from a backer as a backup, if we've not already
 					// requested the same chunk from it.
 
-					let position = backup_validators
-						.iter()
-						.position(|v| !self.recorded_errors.contains_key(&(chunk_index, *v)));
+					let position = backup_validators.iter().position(|v| {
+						!self.recorded_errors.contains_key(&(v.clone(), validator_index))
+					});
 					if let Some(position) = position {
+						// Use swap_remove because it's faster and we don't care about order here.
 						let backer = backup_validators.swap_remove(position);
-						validators.push_front((chunk_index, backer));
-						println!("There");
-					} else {
-						println!("here");
+						validators.push_front((backer, validator_index));
 					}
 				}
 			}
@@ -522,838 +591,6 @@ impl State {
 		}
 
 		(total_received_responses, error_count)
-	}
-}
-
-/// A stateful reconstruction of availability data in reference to
-/// a candidate hash.
-pub struct RecoveryTask<Sender: overseer::AvailabilityRecoverySenderTrait> {
-	sender: Sender,
-	params: RecoveryParams,
-	strategies: VecDeque<Box<dyn RecoveryStrategy<Sender>>>,
-	state: State,
-}
-
-impl<Sender> RecoveryTask<Sender>
-where
-	Sender: overseer::AvailabilityRecoverySenderTrait,
-{
-	/// Instantiate a new recovery task.
-	pub fn new(
-		sender: Sender,
-		params: RecoveryParams,
-		strategies: VecDeque<Box<dyn RecoveryStrategy<Sender>>>,
-	) -> Self {
-		Self { sender, params, strategies, state: State::new() }
-	}
-
-	async fn in_availability_store(&mut self) -> Option<AvailableData> {
-		if !self.params.bypass_availability_store {
-			let (tx, rx) = oneshot::channel();
-			self.sender
-				.send_message(AvailabilityStoreMessage::QueryAvailableData(
-					self.params.candidate_hash,
-					tx,
-				))
-				.await;
-
-			match rx.await {
-				Ok(Some(data)) => return Some(data),
-				Ok(None) => {},
-				Err(oneshot::Canceled) => {
-					gum::warn!(
-						target: LOG_TARGET,
-						candidate_hash = ?self.params.candidate_hash,
-						"Failed to reach the availability store",
-					)
-				},
-			}
-		}
-
-		None
-	}
-
-	/// Run this recovery task to completion. It will loop through the configured strategies
-	/// in-order and return whenever the first one recovers the full `AvailableData`.
-	pub async fn run(mut self) -> Result<AvailableData, RecoveryError> {
-		if let Some(data) = self.in_availability_store().await {
-			return Ok(data)
-		}
-
-		self.params.metrics.on_recovery_started();
-
-		let _timer = self.params.metrics.time_full_recovery();
-
-		while let Some(current_strategy) = self.strategies.pop_front() {
-			let display_name = current_strategy.display_name();
-			let strategy_type = current_strategy.strategy_type();
-
-			gum::debug!(
-				target: LOG_TARGET,
-				candidate_hash = ?self.params.candidate_hash,
-				"Starting `{}` strategy",
-				display_name
-			);
-
-			let res = current_strategy.run(&mut self.state, &mut self.sender, &self.params).await;
-
-			match res {
-				Err(RecoveryError::Unavailable) =>
-					if self.strategies.front().is_some() {
-						gum::debug!(
-							target: LOG_TARGET,
-							candidate_hash = ?self.params.candidate_hash,
-							"Recovery strategy `{}` did not conclude. Trying the next one.",
-							display_name
-						);
-						continue
-					},
-				Err(err) => {
-					match &err {
-						RecoveryError::Invalid =>
-							self.params.metrics.on_recovery_invalid(strategy_type),
-						_ => self.params.metrics.on_recovery_failed(strategy_type),
-					}
-					return Err(err)
-				},
-				Ok(data) => {
-					self.params.metrics.on_recovery_succeeded(strategy_type, data.encoded_size());
-					return Ok(data)
-				},
-			}
-		}
-
-		// We have no other strategies to try.
-		gum::warn!(
-			target: LOG_TARGET,
-			candidate_hash = ?self.params.candidate_hash,
-			"Recovery of available data failed.",
-		);
-
-		self.params.metrics.on_recovery_failed("all");
-
-		Err(RecoveryError::Unavailable)
-	}
-}
-
-/// `RecoveryStrategy` that sequentially tries to fetch the full `AvailableData` from
-/// already-connected validators in the configured validator set.
-pub struct FetchFull {
-	params: FetchFullParams,
-}
-
-pub struct FetchFullParams {
-	/// Validators that will be used for fetching the data.
-	pub validators: Vec<ValidatorIndex>,
-	/// Channel to the erasure task handler.
-	pub erasure_task_tx: futures::channel::mpsc::Sender<ErasureTask>,
-}
-
-impl FetchFull {
-	/// Create a new `FetchFull` recovery strategy.
-	pub fn new(mut params: FetchFullParams) -> Self {
-		params.validators.shuffle(&mut rand::thread_rng());
-		Self { params }
-	}
-}
-
-#[async_trait::async_trait]
-impl<Sender: overseer::AvailabilityRecoverySenderTrait> RecoveryStrategy<Sender> for FetchFull {
-	fn display_name(&self) -> &'static str {
-		"Full recovery from backers"
-	}
-
-	fn strategy_type(&self) -> &'static str {
-		"full_from_backers"
-	}
-
-	async fn run(
-		mut self: Box<Self>,
-		_: &mut State,
-		sender: &mut Sender,
-		common_params: &RecoveryParams,
-	) -> Result<AvailableData, RecoveryError> {
-		let strategy_type = RecoveryStrategy::<Sender>::strategy_type(&*self);
-
-		loop {
-			// Pop the next validator.
-			let validator_index =
-				self.params.validators.pop().ok_or_else(|| RecoveryError::Unavailable)?;
-
-			// Request data.
-			let (req, response) = OutgoingRequest::new(
-				Recipient::Authority(
-					common_params.validator_authority_keys[validator_index.0 as usize].clone(),
-				),
-				req_res::v1::AvailableDataFetchingRequest {
-					candidate_hash: common_params.candidate_hash,
-				},
-			);
-
-			sender
-				.send_message(NetworkBridgeTxMessage::SendRequests(
-					vec![Requests::AvailableDataFetchingV1(req)],
-					IfDisconnected::ImmediateError,
-				))
-				.await;
-
-			common_params.metrics.on_full_request_issued();
-
-			match response.await {
-				Ok(req_res::v1::AvailableDataFetchingResponse::AvailableData(data)) => {
-					let recovery_duration =
-						common_params.metrics.time_erasure_recovery(strategy_type);
-					let maybe_data = match common_params.post_recovery_check {
-						PostRecoveryCheck::Reencode => {
-							let (reencode_tx, reencode_rx) = oneshot::channel();
-							self.params
-								.erasure_task_tx
-								.send(ErasureTask::Reencode(
-									common_params.n_validators,
-									common_params.erasure_root,
-									data,
-									reencode_tx,
-								))
-								.await
-								.map_err(|_| RecoveryError::ChannelClosed)?;
-
-							reencode_rx.await.map_err(|_| RecoveryError::ChannelClosed)?
-						},
-						PostRecoveryCheck::PovHash =>
-							(data.pov.hash() == common_params.pov_hash).then_some(data),
-					};
-
-					match maybe_data {
-						Some(data) => {
-							gum::trace!(
-								target: LOG_TARGET,
-								candidate_hash = ?common_params.candidate_hash,
-								"Received full data",
-							);
-
-							common_params.metrics.on_full_request_succeeded();
-							return Ok(data)
-						},
-						None => {
-							common_params.metrics.on_full_request_invalid();
-							recovery_duration.map(|rd| rd.stop_and_discard());
-
-							gum::debug!(
-								target: LOG_TARGET,
-								candidate_hash = ?common_params.candidate_hash,
-								?validator_index,
-								"Invalid data response",
-							);
-
-							// it doesn't help to report the peer with req/res.
-							// we'll try the next backer.
-						},
-					}
-				},
-				Ok(req_res::v1::AvailableDataFetchingResponse::NoSuchData) => {
-					common_params.metrics.on_full_request_no_such_data();
-				},
-				Err(e) => {
-					match &e {
-						RequestError::Canceled(_) => common_params.metrics.on_full_request_error(),
-						RequestError::InvalidResponse(_) =>
-							common_params.metrics.on_full_request_invalid(),
-						RequestError::NetworkError(req_failure) => {
-							if let RequestFailure::Network(OutboundFailure::Timeout) = req_failure {
-								common_params.metrics.on_full_request_timeout();
-							} else {
-								common_params.metrics.on_full_request_error();
-							}
-						},
-					};
-					gum::debug!(
-						target: LOG_TARGET,
-						candidate_hash = ?common_params.candidate_hash,
-						?validator_index,
-						err = ?e,
-						"Error fetching full available data."
-					);
-				},
-			}
-		}
-	}
-}
-
-/// `RecoveryStrategy` that attempts to recover the systematic chunks from the validators that
-/// hold them, in order to bypass the erasure code reconstruction step, which is costly.
-pub struct FetchSystematicChunks {
-	/// Systematic recovery threshold.
-	threshold: usize,
-	/// Validators that hold the systematic chunks.
-	validators: VecDeque<(ChunkIndex, ValidatorIndex)>,
-	/// Backers. to be used as a backup.
-	backers: Vec<ValidatorIndex>,
-	/// Collection of in-flight requests.
-	requesting_chunks:
-		FuturesUndead<(ChunkIndex, ValidatorIndex, Result<Option<ErasureChunk>, RequestError>)>,
-	/// Channel to the erasure task handler.
-	erasure_task_tx: futures::channel::mpsc::Sender<ErasureTask>,
-}
-
-/// Parameters needed for fetching systematic chunks.
-pub struct FetchSystematicChunksParams {
-	/// Validators that hold the systematic chunks.
-	pub validators: VecDeque<(ChunkIndex, ValidatorIndex)>,
-	/// Validators in the backing group, to be used as a backup for requesting systematic chunks.
-	pub backers: Vec<ValidatorIndex>,
-	/// Channel to the erasure task handler.
-	pub erasure_task_tx: futures::channel::mpsc::Sender<ErasureTask>,
-}
-
-impl FetchSystematicChunks {
-	/// Instantiate a new systematic chunks strategy.
-	pub fn new(params: FetchSystematicChunksParams) -> Self {
-		Self {
-			threshold: params.validators.len(),
-			validators: params.validators,
-			backers: params.backers,
-			requesting_chunks: FuturesUndead::new(),
-			erasure_task_tx: params.erasure_task_tx,
-		}
-	}
-
-	fn is_unavailable(
-		unrequested_validators: usize,
-		in_flight_requests: usize,
-		systematic_chunk_count: usize,
-		threshold: usize,
-	) -> bool {
-		is_unavailable(
-			systematic_chunk_count,
-			in_flight_requests,
-			unrequested_validators,
-			threshold,
-		)
-	}
-
-	/// Desired number of parallel requests.
-	///
-	/// For the given threshold (total required number of chunks) get the desired number of
-	/// requests we want to have running in parallel at this time.
-	fn get_desired_request_count(&self, chunk_count: usize, threshold: usize) -> usize {
-		// Upper bound for parallel requests.
-		let max_requests_boundary = std::cmp::min(N_PARALLEL, threshold);
-		// How many chunks are still needed?
-		let remaining_chunks = threshold.saturating_sub(chunk_count);
-		// Actual number of requests we want to have in flight in parallel:
-		// We don't have to make up for any error rate, as an error fetching a systematic chunk
-		// results in failure of the entire strategy.
-		std::cmp::min(max_requests_boundary, remaining_chunks)
-	}
-
-	async fn attempt_systematic_recovery<Sender: overseer::AvailabilityRecoverySenderTrait>(
-		&mut self,
-		state: &mut State,
-		common_params: &RecoveryParams,
-	) -> Result<AvailableData, RecoveryError> {
-		let strategy_type = RecoveryStrategy::<Sender>::strategy_type(self);
-		let recovery_duration = common_params.metrics.time_erasure_recovery(strategy_type);
-		let reconstruct_duration = common_params.metrics.time_erasure_reconstruct(strategy_type);
-		let chunks = state
-			.received_chunks
-			.range(
-				ChunkIndex(0)..
-					ChunkIndex(
-						u32::try_from(self.threshold)
-							.expect("validator count should not exceed u32"),
-					),
-			)
-			.map(|(_, chunk)| &chunk.chunk[..])
-			.collect::<Vec<_>>();
-
-		let available_data = polkadot_erasure_coding::reconstruct_from_systematic_v1(
-			common_params.n_validators,
-			chunks,
-		);
-
-		match available_data {
-			Ok(data) => {
-				drop(reconstruct_duration);
-
-				// Send request to re-encode the chunks and check merkle root.
-				let (reencode_tx, reencode_rx) = oneshot::channel();
-				self.erasure_task_tx
-					.send(ErasureTask::Reencode(
-						common_params.n_validators,
-						common_params.erasure_root,
-						data,
-						reencode_tx,
-					))
-					.await
-					.map_err(|_| RecoveryError::ChannelClosed)?;
-
-				let reencode_response =
-					reencode_rx.await.map_err(|_| RecoveryError::ChannelClosed)?;
-
-				if let Some(data) = reencode_response {
-					gum::trace!(
-						target: LOG_TARGET,
-						candidate_hash = ?common_params.candidate_hash,
-						erasure_root = ?common_params.erasure_root,
-						"Recovery from systematic chunks complete",
-					);
-
-					Ok(data)
-				} else {
-					recovery_duration.map(|rd| rd.stop_and_discard());
-					gum::trace!(
-						target: LOG_TARGET,
-						candidate_hash = ?common_params.candidate_hash,
-						erasure_root = ?common_params.erasure_root,
-						"Systematic data recovery error - root mismatch",
-					);
-
-					Err(RecoveryError::Invalid)
-				}
-			},
-			Err(err) => {
-				reconstruct_duration.map(|rd| rd.stop_and_discard());
-				recovery_duration.map(|rd| rd.stop_and_discard());
-
-				gum::trace!(
-					target: LOG_TARGET,
-					candidate_hash = ?common_params.candidate_hash,
-					erasure_root = ?common_params.erasure_root,
-					?err,
-					"Systematic data recovery error",
-				);
-
-				Err(RecoveryError::Invalid)
-			},
-		}
-	}
-}
-
-#[async_trait::async_trait]
-impl<Sender: overseer::AvailabilityRecoverySenderTrait> RecoveryStrategy<Sender>
-	for FetchSystematicChunks
-{
-	fn display_name(&self) -> &'static str {
-		"Fetch systematic chunks"
-	}
-
-	fn strategy_type(&self) -> &'static str {
-		"systematic_chunks"
-	}
-
-	async fn run(
-		mut self: Box<Self>,
-		state: &mut State,
-		sender: &mut Sender,
-		common_params: &RecoveryParams,
-	) -> Result<AvailableData, RecoveryError> {
-		// First query the store for any chunks we've got.
-		if !common_params.bypass_availability_store {
-			let local_chunk_indices = state.populate_from_av_store(common_params, sender).await;
-
-			for our_c_index in &local_chunk_indices {
-				// If we are among the systematic validators but hold an invalid chunk, we cannot
-				// perform the systematic recovery. Fall through to the next strategy.
-				if self.validators.iter().any(|(c_index, _)| c_index == our_c_index) &&
-					!state.received_chunks.contains_key(our_c_index)
-				{
-					gum::debug!(
-						target: LOG_TARGET,
-						candidate_hash = ?common_params.candidate_hash,
-						erasure_root = ?common_params.erasure_root,
-						requesting = %self.requesting_chunks.len(),
-						total_requesting = %self.requesting_chunks.total_len(),
-						n_validators = %common_params.n_validators,
-						chunk_index = ?our_c_index,
-						"Systematic chunk recovery is not possible. We are among the systematic validators but hold an invalid chunk",
-					);
-					return Err(RecoveryError::Unavailable)
-				}
-			}
-		}
-
-		// Instead of counting the chunks we already have, perform the difference after we remove
-		// them from the queue.
-		let mut systematic_chunk_count = self.validators.len();
-
-		// No need to query the validators that have the chunks we already received or that we know
-		// don't have the data from previous strategies.
-		self.validators.retain(|(c_index, v_index)| {
-			!state.received_chunks.contains_key(c_index) &&
-				state.can_retry_request(*c_index, *v_index, SYSTEMATIC_CHUNKS_REQ_RETRY_LIMIT)
-		});
-
-		systematic_chunk_count -= self.validators.len();
-
-		// Safe to `take` here, as we're consuming `self` anyway and we're not using the
-		// `validators` field in other methods.
-		let mut validators_queue: VecDeque<_> = std::mem::take(&mut self.validators);
-
-		loop {
-			// If received_chunks has `systematic_chunk_threshold` entries, attempt to recover the
-			// data.
-			if systematic_chunk_count >= self.threshold {
-				return self.attempt_systematic_recovery::<Sender>(state, common_params).await
-			}
-
-			if Self::is_unavailable(
-				validators_queue.len(),
-				self.requesting_chunks.total_len(),
-				systematic_chunk_count,
-				self.threshold,
-			) {
-				gum::debug!(
-					target: LOG_TARGET,
-					candidate_hash = ?common_params.candidate_hash,
-					erasure_root = ?common_params.erasure_root,
-					%systematic_chunk_count,
-					requesting = %self.requesting_chunks.len(),
-					total_requesting = %self.requesting_chunks.total_len(),
-					n_validators = %common_params.n_validators,
-					systematic_threshold = ?self.threshold,
-					"Data recovery from systematic chunks is not possible",
-				);
-
-				return Err(RecoveryError::Unavailable)
-			}
-
-			let desired_requests_count =
-				self.get_desired_request_count(systematic_chunk_count, self.threshold);
-			let already_requesting_count = self.requesting_chunks.len();
-			gum::debug!(
-				target: LOG_TARGET,
-				?common_params.candidate_hash,
-				?desired_requests_count,
-				total_received = ?systematic_chunk_count,
-				systematic_threshold = ?self.threshold,
-				?already_requesting_count,
-				"Requesting systematic availability chunks for a candidate",
-			);
-
-			let strategy_type = RecoveryStrategy::<Sender>::strategy_type(&*self);
-
-			state
-				.launch_parallel_chunk_requests(
-					strategy_type,
-					common_params,
-					sender,
-					desired_requests_count,
-					&mut validators_queue,
-					&mut self.requesting_chunks,
-				)
-				.await;
-
-			let (total_responses, error_count) = state
-				.wait_for_chunks(
-					strategy_type,
-					common_params,
-					SYSTEMATIC_CHUNKS_REQ_RETRY_LIMIT,
-					&mut validators_queue,
-					&mut self.requesting_chunks,
-					&mut self.backers,
-					|unrequested_validators,
-					 in_flight_reqs,
-					 // Don't use this chunk count, as it may contain non-systematic chunks.
-					 _chunk_count,
-					 success_responses| {
-						let chunk_count = systematic_chunk_count + success_responses;
-						let is_unavailable = Self::is_unavailable(
-							unrequested_validators,
-							in_flight_reqs,
-							chunk_count,
-							self.threshold,
-						);
-
-						chunk_count >= self.threshold || is_unavailable
-					},
-				)
-				.await;
-
-			systematic_chunk_count += total_responses - error_count;
-		}
-	}
-}
-
-/// `RecoveryStrategy` that requests chunks from validators, in parallel.
-pub struct FetchChunks {
-	/// How many requests have been unsuccessful so far.
-	error_count: usize,
-	/// Total number of responses that have been received, including failed ones.
-	total_received_responses: usize,
-	/// The collection of chunk indices and the respective validators holding the chunks.
-	validators: VecDeque<(ChunkIndex, ValidatorIndex)>,
-	/// Collection of in-flight requests.
-	requesting_chunks:
-		FuturesUndead<(ChunkIndex, ValidatorIndex, Result<Option<ErasureChunk>, RequestError>)>,
-	/// Channel to the erasure task handler.
-	erasure_task_tx: futures::channel::mpsc::Sender<ErasureTask>,
-}
-
-/// Parameters specific to the `FetchChunks` strategy.
-pub struct FetchChunksParams {
-	/// The collection of chunk indices and the respective validators holding the chunks.
-	pub validators: VecDeque<(ChunkIndex, ValidatorIndex)>,
-	/// Channel to the erasure task handler.
-	pub erasure_task_tx: futures::channel::mpsc::Sender<ErasureTask>,
-}
-
-impl FetchChunks {
-	/// Instantiate a new strategy.
-	pub fn new(mut params: FetchChunksParams) -> Self {
-		// Shuffle the validators to make sure that we don't request chunks from the same
-		// validators over and over.
-		params.validators.make_contiguous().shuffle(&mut rand::thread_rng());
-
-		Self {
-			error_count: 0,
-			total_received_responses: 0,
-			validators: params.validators,
-			requesting_chunks: FuturesUndead::new(),
-			erasure_task_tx: params.erasure_task_tx,
-		}
-	}
-
-	fn is_unavailable(
-		unrequested_validators: usize,
-		in_flight_requests: usize,
-		chunk_count: usize,
-		threshold: usize,
-	) -> bool {
-		is_unavailable(chunk_count, in_flight_requests, unrequested_validators, threshold)
-	}
-
-	/// Desired number of parallel requests.
-	///
-	/// For the given threshold (total required number of chunks) get the desired number of
-	/// requests we want to have running in parallel at this time.
-	fn get_desired_request_count(&self, chunk_count: usize, threshold: usize) -> usize {
-		// Upper bound for parallel requests.
-		// We want to limit this, so requests can be processed within the timeout and we limit the
-		// following feedback loop:
-		// 1. Requests fail due to timeout
-		// 2. We request more chunks to make up for it
-		// 3. Bandwidth is spread out even more, so we get even more timeouts
-		// 4. We request more chunks to make up for it ...
-		let max_requests_boundary = std::cmp::min(N_PARALLEL, threshold);
-		// How many chunks are still needed?
-		let remaining_chunks = threshold.saturating_sub(chunk_count);
-		// What is the current error rate, so we can make up for it?
-		let inv_error_rate =
-			self.total_received_responses.checked_div(self.error_count).unwrap_or(0);
-		// Actual number of requests we want to have in flight in parallel:
-		std::cmp::min(
-			max_requests_boundary,
-			remaining_chunks + remaining_chunks.checked_div(inv_error_rate).unwrap_or(0),
-		)
-	}
-
-	async fn attempt_recovery<Sender: overseer::AvailabilityRecoverySenderTrait>(
-		&mut self,
-		state: &mut State,
-		common_params: &RecoveryParams,
-	) -> Result<AvailableData, RecoveryError> {
-		let recovery_duration = common_params
-			.metrics
-			.time_erasure_recovery(RecoveryStrategy::<Sender>::strategy_type(self));
-
-		// Send request to reconstruct available data from chunks.
-		let (avilable_data_tx, available_data_rx) = oneshot::channel();
-		self.erasure_task_tx
-			.send(ErasureTask::Reconstruct(
-				common_params.n_validators,
-				// Safe to leave an empty vec in place, as we're stopping the recovery process if
-				// this reconstruct fails.
-				std::mem::take(&mut state.received_chunks),
-				avilable_data_tx,
-			))
-			.await
-			.map_err(|_| RecoveryError::ChannelClosed)?;
-
-		let available_data_response =
-			available_data_rx.await.map_err(|_| RecoveryError::ChannelClosed)?;
-
-		match available_data_response {
-			Ok(data) => {
-				let maybe_data = match common_params.post_recovery_check {
-					PostRecoveryCheck::Reencode => {
-						// Send request to re-encode the chunks and check merkle root.
-						let (reencode_tx, reencode_rx) = oneshot::channel();
-						self.erasure_task_tx
-							.send(ErasureTask::Reencode(
-								common_params.n_validators,
-								common_params.erasure_root,
-								data,
-								reencode_tx,
-							))
-							.await
-							.map_err(|_| RecoveryError::ChannelClosed)?;
-
-						reencode_rx.await.map_err(|_| RecoveryError::ChannelClosed)?.or_else(|| {
-							gum::trace!(
-								target: LOG_TARGET,
-								candidate_hash = ?common_params.candidate_hash,
-								erasure_root = ?common_params.erasure_root,
-								"Data recovery error - root mismatch",
-							);
-							None
-						})
-					},
-					PostRecoveryCheck::PovHash =>
-						(data.pov.hash() == common_params.pov_hash).then_some(data).or_else(|| {
-							gum::trace!(
-								target: LOG_TARGET,
-								candidate_hash = ?common_params.candidate_hash,
-								pov_hash = ?common_params.pov_hash,
-								"Data recovery error - PoV hash mismatch",
-							);
-							None
-						}),
-				};
-
-				if let Some(data) = maybe_data {
-					gum::trace!(
-						target: LOG_TARGET,
-						candidate_hash = ?common_params.candidate_hash,
-						erasure_root = ?common_params.erasure_root,
-						"Data recovery from chunks complete",
-					);
-
-					Ok(data)
-				} else {
-					recovery_duration.map(|rd| rd.stop_and_discard());
-
-					Err(RecoveryError::Invalid)
-				}
-			},
-			Err(err) => {
-				recovery_duration.map(|rd| rd.stop_and_discard());
-				gum::trace!(
-					target: LOG_TARGET,
-					candidate_hash = ?common_params.candidate_hash,
-					erasure_root = ?common_params.erasure_root,
-					?err,
-					"Data recovery error",
-				);
-
-				Err(RecoveryError::Invalid)
-			},
-		}
-	}
-}
-
-#[async_trait::async_trait]
-impl<Sender: overseer::AvailabilityRecoverySenderTrait> RecoveryStrategy<Sender> for FetchChunks {
-	fn display_name(&self) -> &'static str {
-		"Fetch chunks"
-	}
-
-	fn strategy_type(&self) -> &'static str {
-		"regular_chunks"
-	}
-
-	async fn run(
-		mut self: Box<Self>,
-		state: &mut State,
-		sender: &mut Sender,
-		common_params: &RecoveryParams,
-	) -> Result<AvailableData, RecoveryError> {
-		// First query the store for any chunks we've got.
-		if !common_params.bypass_availability_store {
-			let local_chunk_indices = state.populate_from_av_store(common_params, sender).await;
-			self.validators.retain(|(c_index, _)| !local_chunk_indices.contains(c_index));
-		}
-
-		// No need to query the validators that have the chunks we already received or that we know
-		// don't have the data from previous strategies.
-		self.validators.retain(|(c_index, v_index)| {
-			!state.received_chunks.contains_key(c_index) &&
-				state.can_retry_request(*c_index, *v_index, REGULAR_CHUNKS_REQ_RETRY_LIMIT)
-		});
-
-		// Safe to `take` here, as we're consuming `self` anyway and we're not using the
-		// `validators` field in other methods.
-		let mut validators_queue = std::mem::take(&mut self.validators);
-
-		loop {
-			// If received_chunks has more than threshold entries, attempt to recover the data.
-			// If that fails, or a re-encoding of it doesn't match the expected erasure root,
-			// return Err(RecoveryError::Invalid).
-			// Do this before requesting any chunks because we may have enough of them coming from
-			// past RecoveryStrategies.
-			if state.chunk_count() >= common_params.threshold {
-				return self.attempt_recovery::<Sender>(state, common_params).await
-			}
-
-			if Self::is_unavailable(
-				validators_queue.len(),
-				self.requesting_chunks.total_len(),
-				state.chunk_count(),
-				common_params.threshold,
-			) {
-				gum::debug!(
-					target: LOG_TARGET,
-					candidate_hash = ?common_params.candidate_hash,
-					erasure_root = ?common_params.erasure_root,
-					received = %state.chunk_count(),
-					requesting = %self.requesting_chunks.len(),
-					total_requesting = %self.requesting_chunks.total_len(),
-					n_validators = %common_params.n_validators,
-					"Data recovery from chunks is not possible",
-				);
-
-				return Err(RecoveryError::Unavailable)
-			}
-
-			let desired_requests_count =
-				self.get_desired_request_count(state.chunk_count(), common_params.threshold);
-			let already_requesting_count = self.requesting_chunks.len();
-			gum::debug!(
-				target: LOG_TARGET,
-				?common_params.candidate_hash,
-				?desired_requests_count,
-				error_count= ?self.error_count,
-				total_received = ?self.total_received_responses,
-				threshold = ?common_params.threshold,
-				?already_requesting_count,
-				"Requesting availability chunks for a candidate",
-			);
-
-			let strategy_type = RecoveryStrategy::<Sender>::strategy_type(&*self);
-
-			state
-				.launch_parallel_chunk_requests(
-					strategy_type,
-					common_params,
-					sender,
-					desired_requests_count,
-					&mut validators_queue,
-					&mut self.requesting_chunks,
-				)
-				.await;
-
-			let (total_responses, error_count) = state
-				.wait_for_chunks(
-					strategy_type,
-					common_params,
-					REGULAR_CHUNKS_REQ_RETRY_LIMIT,
-					&mut validators_queue,
-					&mut self.requesting_chunks,
-					&mut vec![],
-					|unrequested_validators, in_flight_reqs, chunk_count, _success_responses| {
-						chunk_count >= common_params.threshold ||
-							Self::is_unavailable(
-								unrequested_validators,
-								in_flight_reqs,
-								chunk_count,
-								common_params.threshold,
-							)
-					},
-				)
-				.await;
-
-			self.total_received_responses += total_responses;
-			self.error_count += error_count;
-		}
 	}
 }
 
