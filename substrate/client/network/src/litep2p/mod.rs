@@ -310,12 +310,6 @@ impl Litep2pNetworkBackend {
 			yamux_config
 		};
 
-		log::debug!(
-			target: LOG_TARGET,
-			"listen addresses: {:#?}",
-			config.network_config.listen_addresses,
-		);
-
 		let (tcp, websocket): (Vec<Option<_>>, Vec<Option<_>>) = config
 			.network_config
 			.listen_addresses
@@ -543,9 +537,11 @@ impl<B: BlockT + 'static, H: ExHashT> NetworkBackend<B, H> for Litep2pNetworkBac
 			Litep2p::new(config_builder.build()).map_err(|error| Error::Litep2p(error))?;
 
 		let external_addresses: Arc<RwLock<HashSet<Multiaddr>>> = Arc::new(RwLock::new(
-			HashSet::from_iter(known_addresses.into_iter().map(|(_, address)| address).flatten()),
+			HashSet::from_iter(network_config.public_addresses.iter().cloned()),
 		));
 		litep2p.listen_addresses().for_each(|address| {
+			log::debug!(target: LOG_TARGET, "listening on: {address}");
+
 			listen_addresses.write().insert(address.clone());
 		});
 

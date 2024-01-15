@@ -704,18 +704,14 @@ impl Peerset {
 					self.protocol,
 				);
 			},
-			Some(PeerState::Backoff) => {
+			state => {
 				log::debug!(
 					target: LOG_TARGET,
-					"{}: substream open failure for a backed-off connection",
+					"{}: substream open failure for a unknown state: {state:?}",
 					self.protocol,
 				);
-			},
-			state => {
-				panic!(
-					"{}: unexpected state for substream open failure: {peer:?} {state:?}",
-					self.protocol
-				);
+
+				return;
 			},
 		}
 

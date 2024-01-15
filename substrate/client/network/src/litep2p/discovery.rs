@@ -218,7 +218,7 @@ impl Discovery {
 	) -> (Self, PingConfig, IdentifyConfig, KademliaConfig, Option<MdnsConfig>) {
 		let (ping_config, ping_event_stream) = PingConfig::default();
 		let (identify_config, identify_event_stream) =
-			IdentifyConfig::new(config.public_addresses.clone());
+			IdentifyConfig::new(config.listen_addresses.clone());
 
 		let (mdns_config, mdns_event_stream) = match config.transport {
 			crate::config::TransportConfig::Normal { enable_mdns, .. } => match enable_mdns {
@@ -240,7 +240,6 @@ impl Discovery {
 			KademliaConfigBuilder::new()
 				.with_known_peers(known_peers)
 				.with_protocol_names(protocol_names)
-				.with_routing_table_update_mode(RoutingTableUpdateMode::Manual)
 				.build()
 		};
 
@@ -352,10 +351,7 @@ impl Discovery {
 
 	/// Check if `address` can be considered a new external address.
 	fn is_new_external_address(&mut self, address: &Multiaddr) -> bool {
-		// don't even bother checking addresses which cannot be added to DHT
-		if !Discovery::can_add_to_dht(address) {
-			return false
-		}
+		log::trace!(target: LOG_TARGET, "verify new external address: {address}");
 
 		// is the address one of our known addresses
 		if self
@@ -509,4 +505,18 @@ impl Stream for Discovery {
 
 		Poll::Pending
 	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn is_known_address() {}
+
+	#[test]
+	fn can_add_to_dht() {}
+
+	#[test]
+	fn new_external_address() {}
 }
